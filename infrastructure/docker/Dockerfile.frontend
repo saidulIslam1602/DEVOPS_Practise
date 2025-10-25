@@ -1,0 +1,156 @@
+# =============================================================================
+# AquaCulture Frontend Application Dockerfile
+# =============================================================================
+#
+# This Dockerfile creates an optimized container for the React/Vue frontend
+# application that provides:
+# - Interactive dashboards for aquaculture monitoring
+# - Real-time data visualization (charts, graphs, alerts)
+# - User management interface (authentication, profiles)
+# - Fish health monitoring controls and displays
+# - Sensor data configuration and monitoring
+# - ML model management and prediction results
+# - System administration panels
+#
+# Architecture: Multi-stage build for optimal production deployment
+# - Stage 1 (builder): Node.js environment for building the application
+# - Stage 2 (runtime): Nginx web server serving static files
+#
+# Benefits:
+# - Minimal production image size (~15MB vs ~500MB with Node.js)
+# - High performance static file serving with Nginx
+# - Built-in caching and compression
+# - Production-ready security headers
+# =============================================================================
+
+# =============================================================================
+# STAGE 1: BUILD STAGE - Frontend Application Compilation
+# =============================================================================
+# Purpose: Use Node.js to install dependencies and build the frontend application
+# This stage includes development tools and build dependencies
+
+# Build stage using Node.js Alpine for smaller base image
+FROM node:20-alpine as builder
+
+# Set working directory for build operations
+WORKDIR /app
+
+# Copy Package Configuration Files First
+# ======================================
+# Copy package.json and package-lock.json first to leverage Docker layer caching
+# If dependencies haven't changed, npm install layer will be cached
+COPY frontend/package*.json ./
+
+# Install All Dependencies (Production + Development)
+# =================================================
+# Install all dependencies including dev dependencies needed for build process
+RUN npm ci
+# npm ci: Clean install from package-lock.json (faster and more reliable than npm install)
+# Installs exact versions specified in package-lock.json
+# Includes dev dependencies needed for build tools (Webpack, Babel, etc.)
+
+# Copy Frontend Source Code
+# =========================
+# Copy all frontend source files after dependency installation
+# This ensures dependency layer is cached if source changes
+COPY frontend/ ./
+
+# Build Production Application
+# ============================
+# Run the build process to create optimized production files
+RUN npm run build
+# This typically:
+# - Transpiles modern JavaScript/TypeScript to browser-compatible code
+# - Bundles and minifies JavaScript and CSS files
+# - Optimizes images and other assets
+# - Creates static files ready for web server deployment
+# - Outputs to /app/dist directory (or similar)
+
+# =============================================================================
+# STAGE 2: PRODUCTION STAGE - Web Server for Static Files
+# =============================================================================
+# Purpose: Serve the built frontend files using high-performance Nginx web server
+# This stage excludes Node.js and build tools for minimal production image
+
+# Production stage using Nginx Alpine for minimal footprint
+FROM nginx:alpine
+
+# Copy Built Application Files from Builder Stage
+# ==============================================
+# Copy the compiled/built frontend files from the builder stage
+COPY --from=builder /app/dist /usr/share/nginx/html
+# /app/dist: Output directory from npm run build
+# /usr/share/nginx/html: Default Nginx document root
+
+# Copy Custom Nginx Configuration
+# ===============================
+# Use custom Nginx configuration optimized for single-page applications
+COPY infrastructure/docker/nginx.conf /etc/nginx/conf.d/default.conf
+# This configuration typically includes:
+# - SPA routing support (fallback to index.html)
+# - Gzip compression for faster loading
+# - Security headers
+# - Caching policies for static assets
+# - API proxy configuration if needed
+
+# Network Configuration
+# ====================
+# Expose port 80 for HTTP traffic
+# HTTPS termination typically handled by load balancer in production
+EXPOSE 80
+
+# Container Health Monitoring
+# ===========================
+# Configure health check to verify Nginx is serving files correctly
+HEALTHCHECK --interval=30s \     # Check every 30 seconds
+    --timeout=3s \               # Fail if check takes longer than 3 seconds
+    --start-period=5s \          # Wait 5 seconds before first check (fast startup)
+    --retries=3 \                # Mark unhealthy after 3 consecutive failures
+    CMD wget --quiet --tries=1 --spider http://localhost:80 || exit 1
+# wget spider: Check if server responds without downloading content
+
+# Web Server Startup Command
+# ==========================
+# Start Nginx in foreground mode (required for Docker containers)
+CMD ["nginx", "-g", "daemon off;"]
+# -g "daemon off;": Run Nginx in foreground (don't daemonize)
+# This is required for Docker containers to keep the process running
+
+# =============================================================================
+# PRODUCTION DEPLOYMENT NOTES
+# =============================================================================
+#
+# Build Arguments (can be set during docker build):
+# - VITE_API_URL: Backend API endpoint URL
+# - VITE_WS_URL: WebSocket endpoint for real-time updates
+# - VITE_ENVIRONMENT: Build environment (development/staging/production)
+#
+# Environment Variables (set in docker-compose.yml):
+# - API_URL: Backend API endpoint (passed to build process)
+# - WS_URL: WebSocket endpoint for real-time features
+#
+# Nginx Configuration Features:
+# - SPA routing: All routes serve index.html for client-side routing
+# - Gzip compression: Reduces bandwidth usage
+# - Browser caching: Optimizes repeat visits
+# - Security headers: XSS protection, content type sniffing prevention
+# - API proxying: Can proxy /api requests to backend service
+#
+# Performance Optimizations:
+# - Static file serving: Nginx is highly optimized for static content
+# - Compression: Gzip reduces file sizes by 60-80%
+# - Caching: Browser and CDN caching for faster loading
+# - Minification: Build process reduces file sizes
+#
+# Security Considerations:
+# - No Node.js runtime in production (reduced attack surface)
+# - Security headers configured in Nginx
+# - No sensitive data in frontend code (API keys, secrets)
+# - HTTPS termination at load balancer level
+#
+# Scaling Notes:
+# - Stateless: Can be horizontally scaled easily
+# - CDN compatible: Static files work well with CDNs
+# - Load balancer friendly: Multiple instances behind load balancer
+# - Container orchestration ready: Works with Kubernetes, Docker Swarm
+# =============================================================================

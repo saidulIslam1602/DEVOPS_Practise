@@ -1,0 +1,215 @@
+# =============================================================================
+# AquaCulture Background Worker Service Dockerfile
+# =============================================================================
+#
+# This Dockerfile creates a specialized container for background task processing
+# using Celery distributed task queue. The worker service handles:
+# - Asynchronous image processing for fish classification
+# - Batch data processing from IoT sensors
+# - Email notifications and alert dispatching
+# - Report generation and data export operations
+# - Database maintenance and cleanup tasks
+# - File processing and data transformation
+# - Integration with external APIs and services
+#
+# Architecture: Multi-stage build for background processing optimization
+# - Stage 1 (builder): Compile dependencies for task processing
+# - Stage 2 (runtime): Optimized runtime for background operations
+#
+# Task Processing Stack:
+# - Celery for distributed task queue management
+# - Redis as message broker for task distribution
+# - SQLAlchemy for database operations in tasks
+# - Pillow/OpenCV for image processing tasks
+# - Pandas for data manipulation and analysis
+#
+# Scalability Features:
+# - Horizontal scaling with multiple worker instances
+# - Task routing and prioritization
+# - Retry mechanisms for failed tasks
+# - Monitoring and health checks
+# =============================================================================
+
+# =============================================================================
+# STAGE 1: BUILD STAGE - Worker Dependencies Compilation
+# =============================================================================
+# Purpose: Compile packages needed for background task processing
+# This stage includes build tools for worker-specific dependencies
+
+FROM python:3.10-slim as builder
+
+# Set working directory for build operations
+WORKDIR /app
+
+# Install Build Dependencies for Worker Libraries
+# ==============================================
+# These tools are required to compile packages used in background tasks
+RUN apt-get update && apt-get install -y \
+    gcc \                    # GNU C Compiler - for compiled Python packages
+    g++ \                    # GNU C++ Compiler - for C++ extensions
+    libpq-dev \              # PostgreSQL development headers - for database tasks
+    && rm -rf /var/lib/apt/lists/*  # Clean package cache to reduce image size
+
+# Copy Worker Service Requirements
+# ===============================
+# Copy requirements.txt first to leverage Docker layer caching
+# Worker requirements include Celery, image processing, and data manipulation libraries
+COPY requirements.txt .
+
+# Install Worker Python Dependencies
+# =================================
+# Install all packages needed for background task processing
+RUN pip install --no-cache-dir --user -r requirements.txt
+# --no-cache-dir: Don't store pip cache (saves space)
+# --user: Install to /root/.local for easier copying to production stage
+
+# =============================================================================
+# STAGE 2: PRODUCTION STAGE - Worker Runtime Environment
+# =============================================================================
+# Purpose: Create optimized runtime environment for background task processing
+# Excludes build tools but includes worker runtime dependencies
+
+FROM python:3.10-slim
+
+# Set working directory for worker service
+WORKDIR /app
+
+# Install Worker Runtime Dependencies
+# ==================================
+# Install only runtime libraries needed for background task execution
+RUN apt-get update && apt-get install -y \
+    libpq5 \                 # PostgreSQL client library for database operations in tasks
+    && rm -rf /var/lib/apt/lists/*  # Clean package cache
+
+# Copy Compiled Worker Dependencies from Builder Stage
+# ===================================================
+# Copy all installed packages from builder stage
+# This includes Celery, image processing libraries, etc.
+COPY --from=builder /root/.local /root/.local
+
+# Configure Python Environment for Worker
+# =======================================
+# Add user-installed packages to PATH for worker tools and libraries
+ENV PATH=/root/.local/bin:$PATH
+
+# Copy Worker Service Application Code
+# ===================================
+# Copy the worker service code and supporting modules
+COPY services/worker /app/services/worker        # Background task definitions and handlers
+COPY services/__init__.py /app/services/__init__.py  # Python package initialization
+
+# Create Worker-Specific Directories
+# ==================================
+# Create directories for worker operations and data processing
+RUN mkdir -p /app/logs /app/data
+# /app/logs: Worker process logs and task execution logs
+# /app/data: Temporary storage for task processing (images, files, exports)
+
+# Security Configuration - Worker User
+# ===================================
+# Create specialized user for worker operations with appropriate permissions
+RUN useradd -m -u 1000 worker && \         # Create worker user with specific UID
+    chown -R worker:worker /app             # Give user ownership of worker directories
+USER worker                                 # Switch to non-root worker user
+
+# Worker Service Health Monitoring
+# ================================
+# Configure health check to monitor Celery worker status
+# Uses Celery's built-in inspection tools to verify worker health
+HEALTHCHECK --interval=30s \      # Check every 30 seconds
+    --timeout=10s \               # Fail if check takes longer than 10 seconds
+    --start-period=60s \          # Wait 60 seconds before first check (worker startup time)
+    --retries=3 \                 # Mark unhealthy after 3 consecutive failures
+    CMD celery -A services.worker.celery_app inspect ping || exit 1
+# celery inspect ping: Check if worker is responding to management commands
+
+# Worker Service Startup Command
+# ==============================
+# Start Celery worker with optimized configuration for background processing
+CMD ["celery", \
+     "-A", "services.worker.celery_app", \  # Celery application module
+     "worker", \                            # Start worker process
+     "--loglevel=info", \                   # Set logging level for task monitoring
+     "--concurrency=4"]                     # Number of concurrent worker processes
+
+# Alternative startup configurations:
+# For CPU-intensive tasks: --concurrency=2 (fewer processes, more CPU per task)
+# For I/O-intensive tasks: --concurrency=8 (more processes for better I/O handling)
+# For mixed workloads: --autoscale=8,2 (auto-scale between 2-8 processes)
+
+# =============================================================================
+# PRODUCTION DEPLOYMENT NOTES
+# =============================================================================
+#
+# Environment Variables (set in docker-compose.yml):
+# - CELERY_BROKER_URL: Redis connection string for task queue
+# - CELERY_RESULT_BACKEND: Redis connection for task results storage
+# - DATABASE_URL: PostgreSQL connection for database operations in tasks
+# - WORKER_CONCURRENCY: Number of concurrent worker processes
+# - WORKER_PREFETCH_MULTIPLIER: Task prefetch optimization
+#
+# Volume Mounts:
+# - /app/data: Persistent storage for task processing files
+# - /app/logs: Worker and task execution logs
+# - /app/uploads: Temporary storage for file processing tasks
+#
+# Task Types Handled:
+# 1. Image Processing Tasks:
+#    - Fish image classification and analysis
+#    - Batch image processing for ML training
+#    - Image resizing and optimization
+#
+# 2. Data Processing Tasks:
+#    - Sensor data aggregation and analysis
+#    - Report generation from database queries
+#    - Data export to various formats (CSV, PDF, Excel)
+#
+# 3. Notification Tasks:
+#    - Email notifications for alerts and reports
+#    - SMS notifications for critical alerts
+#    - Push notifications to mobile apps
+#
+# 4. Maintenance Tasks:
+#    - Database cleanup and optimization
+#    - Log rotation and archiving
+#    - Cache warming and invalidation
+#
+# Resource Requirements:
+# - CPU: 1-4 cores (depends on task types and concurrency)
+# - Memory: 512MB-4GB (depends on data processing requirements)
+# - Storage: Variable (depends on file processing needs)
+#
+# Scaling Strategies:
+# 1. Horizontal Scaling:
+#    - Run multiple worker instances
+#    - Use task routing for specialized workers
+#    - Load balance across worker instances
+#
+# 2. Task Prioritization:
+#    - High priority: Real-time alerts and notifications
+#    - Medium priority: Image processing and analysis
+#    - Low priority: Report generation and maintenance
+#
+# 3. Queue Management:
+#    - Separate queues for different task types
+#    - Dead letter queues for failed tasks
+#    - Task retry policies and exponential backoff
+#
+# Monitoring and Observability:
+# - Celery Flower for task monitoring dashboard
+# - Prometheus metrics for task execution statistics
+# - Grafana dashboards for worker performance visualization
+# - Alert rules for failed tasks and worker health
+#
+# Security Considerations:
+# - Runs as non-root worker user
+# - Input validation for all task parameters
+# - Secure handling of sensitive data in tasks
+# - Rate limiting for resource-intensive tasks
+#
+# Performance Optimizations:
+# - Task result caching in Redis
+# - Connection pooling for database operations
+# - Batch processing for similar tasks
+# - Memory-efficient data processing techniques
+# =============================================================================

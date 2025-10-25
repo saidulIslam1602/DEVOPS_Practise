@@ -1,0 +1,159 @@
+# =============================================================================
+# AquaCulture FastAPI Backend Service Dockerfile
+# =============================================================================
+#
+# This Dockerfile creates an optimized container for the FastAPI REST API service
+# that handles:
+# - User authentication and authorization (JWT tokens)
+# - Fish health monitoring data collection and analysis
+# - Sensor data aggregation and storage
+# - ML model integration for predictions
+# - Real-time data streaming via WebSockets
+# - RESTful API endpoints for frontend consumption
+#
+# Architecture: Multi-stage build for production optimization
+# - Stage 1 (builder): Compile dependencies with build tools
+# - Stage 2 (runtime): Clean production image without build tools
+#
+# Security Features:
+# - Non-root user execution
+# - Minimal attack surface (slim base image)
+# - Health checks for container orchestration
+# - Secure dependency installation
+# =============================================================================
+
+# =============================================================================
+# STAGE 1: BUILD STAGE - Dependency Compilation
+# =============================================================================
+# Purpose: Install build tools and compile Python packages with C extensions
+# This stage includes heavy build dependencies that aren't needed in production
+
+FROM python:3.10-slim as builder
+
+# Set working directory for build operations
+WORKDIR /app
+
+# Install Build Dependencies
+# =========================
+# These tools are required to compile Python packages with C extensions
+# but will NOT be included in the final production image
+RUN apt-get update && apt-get install -y \
+    gcc \                    # GNU C Compiler - compiles C extensions in Python packages
+    g++ \                    # GNU C++ Compiler - for C++ extensions
+    libpq-dev \              # PostgreSQL development headers - needed for psycopg2 compilation
+    && rm -rf /var/lib/apt/lists/*  # Clean package cache to reduce image size
+
+# Copy Python Requirements
+# ========================
+# Copy only requirements.txt first to leverage Docker layer caching
+# If requirements.txt hasn't changed, this layer will be cached
+COPY requirements.txt .
+
+# Install Python Dependencies to User Directory
+# ============================================
+# Install all Python packages including those requiring compilation
+RUN pip install --no-cache-dir --user -r requirements.txt
+# --no-cache-dir: Don't store pip cache (saves space)
+# --user: Install to /root/.local instead of system-wide (easier to copy later)
+
+# =============================================================================
+# STAGE 2: PRODUCTION STAGE - Runtime Environment
+# =============================================================================
+# Purpose: Create minimal production image with only runtime dependencies
+# This stage excludes build tools for security and size optimization
+
+FROM python:3.10-slim
+
+# Set working directory for application
+WORKDIR /app
+
+# Install Runtime Dependencies Only
+# =================================
+# Only install libraries needed to RUN the application, not build it
+RUN apt-get update && apt-get install -y \
+    libpq5 \                 # PostgreSQL client library (runtime only, no headers)
+    curl \                   # HTTP client for health checks and external API calls
+    && rm -rf /var/lib/apt/lists/*  # Clean package cache
+
+# Copy Compiled Python Dependencies from Builder Stage
+# ===================================================
+# Copy all installed Python packages from builder stage
+# This includes compiled extensions but excludes build tools
+COPY --from=builder /root/.local /root/.local
+
+# Configure Python Environment
+# ============================
+# Add user-installed packages to PATH so they can be executed
+ENV PATH=/root/.local/bin:$PATH
+
+# Copy Application Source Code
+# ============================
+# Copy the FastAPI application and supporting modules
+COPY services/api /app/services/api              # Main API service code
+COPY services/__init__.py /app/services/__init__.py  # Python package initialization
+
+# Security Configuration - Non-Root User
+# ======================================
+# Create and switch to non-root user for security best practices
+# Running as root inside containers is a security risk
+RUN useradd -m -u 1000 appuser && \             # Create user with specific UID for consistency
+    chown -R appuser:appuser /app                # Give user ownership of application directory
+USER appuser                                     # Switch to non-root user
+
+# Network Configuration
+# ====================
+# Expose port 8000 for the FastAPI application
+# This is documentation only - actual port mapping happens in docker-compose
+EXPOSE 8000
+
+# Container Health Monitoring
+# ===========================
+# Configure health check to monitor application status
+# Container orchestrators use this to determine if container is healthy
+HEALTHCHECK --interval=30s \      # Check every 30 seconds
+    --timeout=10s \               # Fail if check takes longer than 10 seconds
+    --start-period=40s \          # Wait 40 seconds before first check (startup time)
+    --retries=3 \                 # Mark unhealthy after 3 consecutive failures
+    CMD curl -f http://localhost:8000/health || exit 1  # HTTP GET to health endpoint
+
+# Application Startup Command
+# ===========================
+# Start the FastAPI application using Uvicorn ASGI server
+# Configuration optimized for production deployment
+CMD ["uvicorn", \
+     "services.api.main:app", \   # Python module path to FastAPI app instance
+     "--host", "0.0.0.0", \       # Listen on all interfaces (not just localhost)
+     "--port", "8000"]            # Listen on port 8000
+
+# =============================================================================
+# PRODUCTION DEPLOYMENT NOTES
+# =============================================================================
+#
+# Environment Variables (set in docker-compose.yml):
+# - DATABASE_URL: PostgreSQL connection string
+# - REDIS_URL: Redis connection string for caching
+# - JWT_SECRET: Secret key for JWT token signing
+# - ENVIRONMENT: deployment environment (development/staging/production)
+# - LOG_LEVEL: application logging level (DEBUG/INFO/WARNING/ERROR)
+#
+# Volume Mounts:
+# - /app/data: Persistent storage for uploads and generated files
+# - /app/logs: Application log files (if file logging is enabled)
+#
+# Resource Recommendations:
+# - CPU: 0.5-2 cores depending on load
+# - Memory: 512MB-2GB depending on concurrent users
+# - Storage: Minimal (application is stateless)
+#
+# Scaling Considerations:
+# - This container is stateless and can be horizontally scaled
+# - Use load balancer for multiple instances
+# - Database connections are pooled via SQLAlchemy
+# - Redis is used for session storage and caching
+#
+# Security Notes:
+# - Runs as non-root user (appuser)
+# - No build tools in production image
+# - Minimal base image reduces attack surface
+# - Health checks enable proper orchestration
+# =============================================================================

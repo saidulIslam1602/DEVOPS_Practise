@@ -1,0 +1,192 @@
+# =============================================================================
+# AquaCulture Machine Learning Service Dockerfile
+# =============================================================================
+#
+# This Dockerfile creates a specialized container for ML inference operations
+# that handles:
+# - Fish species classification from uploaded images
+# - Health status prediction based on sensor data patterns
+# - Anomaly detection in water quality parameters
+# - Real-time inference API endpoints
+# - Model loading and management
+# - Batch processing for large datasets
+# - Integration with computer vision libraries (OpenCV, PIL)
+#
+# Architecture: Multi-stage build optimized for ML workloads
+# - Stage 1 (builder): Compile ML libraries and dependencies
+# - Stage 2 (runtime): Optimized runtime with ML libraries only
+#
+# ML Stack:
+# - PyTorch/TensorFlow for deep learning models
+# - OpenCV for image preprocessing
+# - NumPy/Pandas for data manipulation
+# - Scikit-learn for traditional ML algorithms
+# - FastAPI for serving inference endpoints
+#
+# Performance Considerations:
+# - Optimized for CPU inference (GPU support can be added)
+# - Memory-efficient model loading
+# - Batch processing capabilities
+# - Model caching and warm-up strategies
+# =============================================================================
+
+# =============================================================================
+# STAGE 1: BUILD STAGE - ML Library Compilation
+# =============================================================================
+# Purpose: Compile ML libraries and dependencies that require build tools
+# This stage includes heavy compilation tools needed for ML packages
+
+FROM python:3.10-slim as builder
+
+# Set working directory for build operations
+WORKDIR /app
+
+# Install Build Dependencies for ML Libraries
+# ==========================================
+# These tools are required to compile ML packages with native extensions
+# Many ML libraries (NumPy, SciPy, OpenCV) require compilation
+RUN apt-get update && apt-get install -y \
+    gcc \                    # GNU C Compiler - required for NumPy, SciPy compilation
+    g++ \                    # GNU C++ Compiler - required for OpenCV, PyTorch
+    libpq-dev \              # PostgreSQL development headers - for database connectivity
+    && rm -rf /var/lib/apt/lists/*  # Clean package cache to reduce image size
+
+# Copy ML Service Requirements
+# ============================
+# Copy requirements.txt first to leverage Docker layer caching
+# ML requirements typically include heavy packages like PyTorch, TensorFlow
+COPY requirements.txt .
+
+# Install ML Python Dependencies
+# ==============================
+# Install all ML packages including those requiring compilation
+RUN pip install --no-cache-dir --user -r requirements.txt
+# --no-cache-dir: Don't store pip cache (important for ML packages which are large)
+# --user: Install to /root/.local for easier copying to production stage
+# This step can take 10-15 minutes for ML packages
+
+# =============================================================================
+# STAGE 2: PRODUCTION STAGE - ML Runtime Environment
+# =============================================================================
+# Purpose: Create optimized runtime environment for ML inference
+# Excludes build tools but includes ML runtime dependencies
+
+FROM python:3.10-slim
+
+# Set working directory for ML service
+WORKDIR /app
+
+# Install ML Runtime Dependencies
+# ===============================
+# Install only runtime libraries needed for ML inference
+RUN apt-get update && apt-get install -y \
+    libpq5 \                 # PostgreSQL client library for database connections
+    libgomp1 \               # OpenMP runtime for parallel processing in ML libraries
+    curl \                   # HTTP client for health checks and model downloads
+    && rm -rf /var/lib/apt/lists/*  # Clean package cache
+
+# Copy Compiled ML Dependencies from Builder Stage
+# ===============================================
+# Copy all installed ML packages from builder stage
+# This includes compiled NumPy, PyTorch, OpenCV, etc.
+COPY --from=builder /root/.local /root/.local
+
+# Configure Python Environment for ML
+# ===================================
+# Add user-installed packages to PATH for ML tools and libraries
+ENV PATH=/root/.local/bin:$PATH
+
+# Copy ML Service Application Code
+# ================================
+# Copy the ML service code and supporting modules
+COPY services/ml-service /app/services/ml-service    # ML inference service code
+COPY services/__init__.py /app/services/__init__.py  # Python package initialization
+
+# Create ML-Specific Directories
+# ==============================
+# Create directories for ML models and data processing
+RUN mkdir -p /app/models /app/data
+# /app/models: Storage for trained ML models (.pth, .pkl, .h5 files)
+# /app/data: Temporary storage for image processing and batch operations
+
+# Security Configuration - ML User
+# ================================
+# Create specialized user for ML operations with appropriate permissions
+RUN useradd -m -u 1000 mluser && \          # Create ML user with specific UID
+    chown -R mluser:mluser /app              # Give user ownership of ML directories
+USER mluser                                  # Switch to non-root ML user
+
+# Network Configuration for ML Service
+# ====================================
+# Expose port 8001 for ML inference API (separate from main API)
+EXPOSE 8001
+
+# ML Service Health Monitoring
+# ============================
+# Configure health check with longer startup time for ML model loading
+HEALTHCHECK --interval=30s \      # Check every 30 seconds
+    --timeout=10s \               # Fail if check takes longer than 10 seconds
+    --start-period=60s \          # Wait 60 seconds before first check (ML models need time to load)
+    --retries=3 \                 # Mark unhealthy after 3 consecutive failures
+    CMD curl -f http://localhost:8001/health || exit 1  # HTTP GET to ML service health endpoint
+
+# ML Service Startup Command
+# ==========================
+# Start the ML inference service using Uvicorn ASGI server
+# Configured for ML workload characteristics
+CMD ["uvicorn", \
+     "services.ml-service.main:app", \  # Python module path to ML FastAPI app
+     "--host", "0.0.0.0", \            # Listen on all interfaces
+     "--port", "8001"]                  # Listen on port 8001 (separate from main API)
+
+# =============================================================================
+# PRODUCTION DEPLOYMENT NOTES
+# =============================================================================
+#
+# Environment Variables (set in docker-compose.yml):
+# - MODEL_PATH: Path to trained ML models directory
+# - BATCH_SIZE: Inference batch size for optimal performance
+# - MAX_IMAGE_SIZE: Maximum allowed image size for processing
+# - CACHE_SIZE: Number of models to keep in memory cache
+# - GPU_ENABLED: Enable GPU acceleration if available
+#
+# Volume Mounts:
+# - /app/models: Persistent storage for trained ML models
+# - /app/data: Temporary storage for image processing
+# - /app/cache: Model cache for faster loading
+#
+# Resource Requirements:
+# - CPU: 2-4 cores (ML inference is CPU intensive)
+# - Memory: 2-8GB (depends on model size and batch processing)
+# - Storage: 1-10GB for models and temporary data
+#
+# GPU Support (Optional):
+# To enable GPU acceleration, modify the Dockerfile:
+# 1. Use nvidia/cuda base image instead of python:3.10-slim
+# 2. Install CUDA-compatible PyTorch/TensorFlow
+# 3. Add GPU device mapping in docker-compose.yml
+#
+# Model Management:
+# - Models are loaded at startup for faster inference
+# - Support for multiple model versions
+# - Model hot-swapping without service restart
+# - Automatic model validation and fallback
+#
+# Performance Optimizations:
+# - Model caching in memory for faster inference
+# - Batch processing for multiple predictions
+# - Image preprocessing optimization
+# - Connection pooling for database operations
+#
+# Security Considerations:
+# - Runs as non-root mluser
+# - Input validation for uploaded images
+# - Rate limiting for inference requests
+# - Model file integrity verification
+#
+# Scaling Notes:
+# - Stateless service can be horizontally scaled
+# - Load balancing across multiple ML instances
+# - Model sharing via network storage or model registry
+# - Auto-scaling based on inference queue length
+# =============================================================================
